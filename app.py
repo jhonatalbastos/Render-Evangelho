@@ -1,172 +1,276 @@
 import streamlit as st
 import json
-import base64
-import numpy as np
 import os
-import subprocess
+import numpy as np
+from moviepy.editor import ImageClip, AudioFileClip, CompositeVideoClip, TextClip, ColorClip, concatenate_videoclips
+from moviepy.video.fx.all import resize, crop
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-from scipy.io import wavfile
-import io
-import time
+import math
+import tempfile
+import glob
 
-# Configurações de Saída
-FPS = 30
-WIDTH = 1080
-HEIGHT = 1920
+# === CONFIGURAÇÃO ===
+st.set_page_config(page_title="Render Farm - TikTok Studio", layout="wide")
+RENDER_QUEUE_DIR = "TikTok_Render_Queue" # Se rodar local. Na nuvem, usaria Google Drive API.
 
-def get_base64_data(data_url):
-    return base64.b64decode(data_url.split(",")[1])
+# --- SIMULAÇÃO DE GOOGLE DRIVE (PARA DEMONSTRAÇÃO) ---
+# Em produção real no Streamlit Cloud, você usaria:
+# from google.oauth2 import service_account
+# from googleapiclient.discovery import build
+# E baixaria os arquivos do Drive para um temp dir.
+# Aqui, assumimos que você baixou a pasta do Drive para local ou está sincronizado.
 
-def draw_rounded_rect(draw, coords, radius, fill):
-    x1, y1, x2, y2 = coords
-    draw.rectangle([x1 + radius, y1, x2 - radius, y2], fill=fill)
-    draw.rectangle([x1, y1 + radius, x2, y2 - radius], fill=fill)
-    draw.pieslice([x1, y1, x1 + radius * 2, y1 + radius * 2], 180, 270, fill=fill)
-    draw.pieslice([x2 - radius * 2, y1, x2, y1 + radius * 2], 270, 360, fill=fill)
-    draw.pieslice([x1, y2 - radius * 2, x1 + radius * 2, y2], 90, 180, fill=fill)
-    draw.pieslice([x2 - radius * 2, y2 - radius * 2, x2, y2], 0, 90, fill=fill)
+st.title("🎬 Render Farm - Liturgia TikTok")
+st.markdown("Renderizador Server-Side usando MoviePy + Pillow para replicar o Canvas HTML5.")
 
-def render_video(data):
-    st.info("Iniciando Renderização Pesada... Isso pode levar alguns minutos.")
+# === RENDERER ENGINE (CORE) ===
+
+def rounded_rectangle(draw, xy, corner_radius, fill=None, outline=None):
+    upper_left_point = xy[0]
+    bottom_right_point = xy[1]
+    draw.rectangle(
+        [
+            (upper_left_point[0], upper_left_point[1] + corner_radius),
+            (bottom_right_point[0], bottom_right_point[1] - corner_radius)
+        ],
+        fill=fill, outline=outline
+    )
+    draw.rectangle(
+        [
+            (upper_left_point[0] + corner_radius, upper_left_point[1]),
+            (bottom_right_point[0] - corner_radius, bottom_right_point[1])
+        ],
+        fill=fill, outline=outline
+    )
+    draw.pieslice([upper_left_point[0], upper_left_point[1], upper_left_point[0] + corner_radius * 2, upper_left_point[1] + corner_radius * 2], 180, 270, fill=fill, outline=outline)
+    draw.pieslice([bottom_right_point[0] - corner_radius * 2, bottom_right_point[1] - corner_radius * 2, bottom_right_point[0], bottom_right_point[1]], 0, 90, fill=fill, outline=outline)
+    draw.pieslice([upper_left_point[0], bottom_right_point[1] - corner_radius * 2, upper_left_point[0] + corner_radius * 2, bottom_right_point[1]], 90, 180, fill=fill, outline=outline)
+    draw.pieslice([bottom_right_point[0] - corner_radius * 2, upper_left_point[1], bottom_right_point[0], upper_left_point[1] + corner_radius * 2], 270, 360, fill=fill, outline=outline)
+
+def create_frame(t, img_pil, settings, audio_duration, block_index, liturgy_info, gospel_ref, date_str):
+    # Dimensões
+    W, H = 1080, 1920
     
-    # Pastas temporárias
-    if not os.path.exists("temp_frames"): os.makedirs("temp_frames")
+    # === 1. FUNDO & ZOOM (Ken Burns) ===
+    # Simula o zoom contínuo do JS
+    motion_speed = float(settings['visuals']['motionSpeed'])
+    scale = 1.0 + (t * (motion_speed * 0.003)) if settings['visuals']['motionEnabled'] else 1.0
     
-    settings = data['settings']
-    blocks = data['blocks']
+    # Redimensiona imagem baseada na escala
+    new_w = int(W * scale)
+    new_h = int(H * scale)
+    # Garante aspect ratio cover
+    img_resized = img_pil.resize((new_w, new_h), Image.LANCZOS)
     
-    # Processar Áudios para calcular duração total e waveforms
-    total_duration = 0
-    audio_segments = []
+    # Crop central
+    left = (new_w - W) // 2
+    top = (new_h - H) // 2
+    bg = img_resized.crop((left, top, left + W, top + H))
     
-    for b in blocks:
-        audio_bytes = get_base64_data(b['audio'])
-        samplerate, audio_data = wavfile.read(io.BytesIO(audio_bytes))
-        
-        # Se for stereo, converter para mono para o waveform
-        if len(audio_data.shape) > 1:
-            audio_data_mono = audio_data.mean(axis=1)
-        else:
-            audio_data_mono = audio_data
-            
-        duration = len(audio_data) / samplerate
-        audio_segments.append({
-            'data': audio_data,
-            'mono': audio_data_mono,
-            'rate': samplerate,
-            'start': total_duration,
-            'end': total_duration + duration,
-            'img': Image.open(io.BytesIO(get_base64_data(b['image']))).convert("RGB")
-        })
-        total_duration += duration + 0.5 # Gap de 0.5s entre blocos
+    # Converte para RGBA para overlays
+    canvas = bg.convert("RGBA")
+    overlay = Image.new("RGBA", (W, H), (0,0,0,0))
+    draw = ImageDraw.Draw(overlay)
+    
+    # === 2. PARTÍCULAS (Simplificado) ===
+    if settings['visuals']['particlesEnabled']:
+        # Partículas estáticas randômicas por frame para simular cintilação
+        # Para performance real em python, não rastreamos estado, apenas noise dourado
+        for _ in range(int(settings['visuals'].get('particlesCount', 50))):
+            x = np.random.randint(0, W)
+            y = np.random.randint(0, H)
+            r = np.random.randint(1, int(settings['visuals'].get('particlesSize', 3)) + 1)
+            alpha = np.random.randint(100, 200)
+            draw.ellipse([x, y, x+r, y+r], fill=(255, 223, 128, alpha))
 
-    total_frames = int(total_duration * FPS)
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    # === 3. OVERLAYS DE TEXTO ===
+    center_x = W // 2
+    y_pos = int(settings['visuals']['textYPos'])
+    
+    # Configurações de Fade/Slide
+    fade_dur = 1.0
+    slide_dur = float(settings['visuals']['slideDuration'])
+    alpha_text = 255
+    y_offset = 0
+    
+    # Entrada (Fade In + Slide Up)
+    if t < fade_dur:
+        prog = t / fade_dur
+        alpha_text = int(255 * prog)
+        y_offset = (1 - prog) * 50
+    # Saída (Fade Out + Slide Down)
+    elif settings['visuals']['slideEnabled'] and t > slide_dur:
+        prog = (t - slide_dur) / 1.0 # 1s fade out
+        if prog > 1: prog = 1
+        alpha_text = int(255 * (1 - prog))
+        y_offset = prog * 50
 
-    # Preparar Fontes (Assumindo que você subiu os arquivos .ttf pro repo)
+    # Títulos fixos (Entrada apenas)
+    title_titles = ["EVANGELHO", "REFLEXÃO", "APLICAÇÃO", "ORAÇÃO"]
+    curr_title = title_titles[block_index] if block_index < 4 else ""
+    
+    # Carregar Fontes (Fallback se não tiver arquivo)
     try:
-        font_title = ImageFont.truetype("AlegreyaSans-Bold.ttf", int(settings['titleSize']))
-        font_sub = ImageFont.truetype("AlegreyaSans-Regular.ttf", int(settings['subtitleSize']))
+        font_title = ImageFont.truetype("AlegreyaSans-Bold.ttf", int(settings['visuals']['titleSize']))
+        font_sub = ImageFont.truetype("AlegreyaSans-Regular.ttf", int(settings['visuals']['subtitleSize']))
+        font_sub_sm = ImageFont.truetype("AlegreyaSans-Italic.ttf", int(settings['visuals']['subtitleSize']) * 0.8)
     except:
         font_title = ImageFont.load_default()
         font_sub = ImageFont.load_default()
+        font_sub_sm = ImageFont.load_default()
 
-    # Loop de Frames
-    for f in range(total_frames):
-        t = f / FPS
-        frame_img = Image.new("RGB", (WIDTH, HEIGHT), (0, 0, 0))
-        draw = ImageDraw.Draw(frame_img)
+    # --- Render Título Principal (Persistente) ---
+    # Fica visível sempre (exceto entrada)
+    persist_alpha = 255 if t >= fade_dur else int(255 * (t/fade_dur))
+    if persist_alpha > 0:
+        # Fundo Título
+        t_bbox = draw.textbbox((0,0), curr_title, font=font_title)
+        t_w = t_bbox[2] - t_bbox[0] + 80
+        t_h = int(settings['visuals']['titleSize']) * 1.4
         
-        # Encontrar bloco atual
-        active_segment = next((s for s in audio_segments if s['start'] <= t <= s['end']), None)
+        rect_color = (85, 85, 85, int(128 * (persist_alpha/255))) # 0.5 opacity
+        rounded_rectangle(draw, [(center_x - t_w/2, y_pos), (center_x + t_w/2, y_pos + t_h)], 20, fill=rect_color)
         
-        if active_segment:
-            # 1. Background com Zoom (Motion)
-            bg = active_segment['img']
-            block_t = t - active_segment['start']
-            scale = 1.0 + (block_t * (settings['motionSpeed'] * 0.01))
-            
-            # Crop & Resize
-            w, h = bg.size
-            new_w = int(WIDTH / scale)
-            new_h = int(HEIGHT / scale)
-            left = (w - new_w) // 2
-            top = (h - new_h) // 2
-            bg_cropped = bg.crop((left, top, left + new_w, top + new_h)).resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
-            frame_img.paste(bg_cropped, (0, 0))
-            
-            # 2. Partículas (Simulação simplificada)
-            if settings['particlesEnabled']:
-                for p in range(int(settings['particlesCount'])):
-                    px = (hash(f"x{p}") % WIDTH)
-                    py = (HEIGHT - (f * 2 + hash(f"y{p}")) % HEIGHT)
-                    size = int(settings['particlesSize'])
-                    draw.ellipse([px, py, px+size, py+size], fill=(255, 223, 128, 180))
+        # Texto Título
+        draw.text((center_x, y_pos + t_h/2), curr_title, font=font_title, fill=(255,255,255,persist_alpha), anchor="mm")
 
-            # 3. Overlays (Waveform e Textos)
-            cx = WIDTH // 2
-            y_pos = int(settings['textYPos'])
-            
-            # Titulo
-            title_txt = ["EVANGELHO", "REFLEXÃO", "APLICAÇÃO", "ORAÇÃO"][audio_segments.index(active_segment)]
-            tw = draw.textlength(title_txt, font=font_title)
-            draw_rounded_rect(draw, [cx - tw/2 - 40, y_pos, cx + tw/2 + 40, y_pos + settings['titleSize']*1.2], 20, (85, 85, 85, 128))
-            draw.text((cx, y_pos + settings['titleSize']*0.6), title_txt, fill="white", font=font_title, anchor="mm")
-
-            # Waveform Dinâmico
-            sample_idx = int(block_t * active_segment['rate'])
-            if sample_idx < len(active_segment['mono']):
-                chunk = active_segment['mono'][max(0, sample_idx-500):sample_idx+500]
-                amp = np.abs(chunk).mean() if len(chunk) > 0 else 0
-                wave_h = int(amp * settings['waveAmp'] * 200) + 10
-                # Desenhar algumas barras
-                for i in range(int(settings['waveWidth'])):
-                    bar_x = cx + (i * 25)
-                    draw_rounded_rect(draw, [bar_x, HEIGHT//2 - wave_h//2, bar_x + 15, HEIGHT//2 + wave_h//2], 7, (255, 255, 255, 150))
-                    bar_x_inv = cx - (i * 25) - 15
-                    draw_rounded_rect(draw, [bar_x_inv, HEIGHT//2 - wave_h//2, bar_x_inv + 15, HEIGHT//2 + wave_h//2], 7, (255, 255, 255, 150))
-
-        # Salvar Frame
-        frame_img.save(f"temp_frames/frame_{f:05d}.jpg", quality=85)
+    # --- Render Subtítulos (Transientes) ---
+    if alpha_text > 0:
+        curr_y = y_pos + y_offset + (int(settings['visuals']['titleSize']) * 1.4) + 15
+        sub_h = int(settings['visuals']['subtitleSize']) * 1.4
         
-        if f % 30 == 0:
-            progress_bar.progress(f / total_frames)
-            status_text.text(f"Renderizando frame {f} de {total_frames}...")
+        sub_data = [
+            (date_str, font_sub),
+            (gospel_ref, font_sub),
+            (liturgy_info['liturgia'], font_sub_sm)
+        ]
+        
+        for text, fnt in sub_data:
+            s_bbox = draw.textbbox((0,0), text, font=fnt)
+            s_w = s_bbox[2] - s_bbox[0] + 60
+            
+            rect_col = (119, 119, 119, int(128 * (alpha_text/255)))
+            rounded_rectangle(draw, [(center_x - s_w/2, curr_y), (center_x + s_w/2, curr_y + sub_h)], 10, fill=rect_col)
+            draw.text((center_x, curr_y + sub_h/2), text, font=fnt, fill=(255,255,255,alpha_text), anchor="mm")
+            
+            curr_y += sub_h + 15
 
-    # 4. Combinar com FFmpeg
-    status_text.text("Combinando áudio e vídeo com FFmpeg...")
+    # === 4. WAVEFORM ===
+    # Simulado visualmente
+    wave_bars = int(settings['visuals']['waveformWidth'])
+    wave_y = H // 2
+    wave_opac = int(float(settings['visuals']['waveformOpacity']) * 2.55)
+    wave_amp = float(settings['visuals']['waveformAmplitude'])
     
-    # Criar arquivo de áudio concatenado
-    # (Para simplificar no Streamlit, vamos usar o FFmpeg para juntar os áudios também)
-    with open("audio_list.txt", "w") as f_list:
-        for i, b in enumerate(blocks):
-            with open(f"temp_audio_{i}.wav", "wb") as fa:
-                fa.write(get_base64_data(b['audio']))
-            f_list.write(f"file 'temp_audio_{i}.wav'\n")
-            f_list.write("file 'silence.wav'\n") # Adicionar silencio se necessário
-            
-    # Comando FFmpeg Final
-    cmd = [
-        'ffmpeg', '-y',
-        '-framerate', str(FPS),
-        '-i', 'temp_frames/frame_%05d.jpg',
-        '-i', 'temp_audio_0.wav', # Simplificado: pegando o primeiro áudio para teste. 
-        # Em produção, você concatenaria os 4 áudios antes.
-        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast',
-        '-c:a', 'aac', '-shortest', 'output.mp4'
-    ]
+    # Animação baseada no tempo
+    for i in range(wave_bars):
+        # Simula movimento com senoide
+        val = (math.sin(i * 0.5 + t * 5) + 1) * 30 * wave_amp + 10
+        # Randomness para parecer voz
+        val += np.random.randint(0, 10)
+        
+        bar_w = 15
+        gap = 8
+        
+        # Lado Direito
+        xr = center_x + (i * (bar_w + gap)) + gap/2
+        draw.rectangle([xr, wave_y - val/2, xr + bar_w, wave_y + val/2], fill=(255,255,255, wave_opac))
+        
+        # Lado Esquerdo
+        xl = center_x - ((i+1) * (bar_w + gap)) + gap/2
+        draw.rectangle([xl, wave_y - val/2, xl + bar_w, wave_y + val/2], fill=(255,255,255, wave_opac))
+
+    # Compor
+    out = Image.alpha_composite(canvas, overlay)
+    return np.array(out)
+
+def render_project(project_path):
+    st.info(f"Iniciando renderização de: {project_path}")
     
-    subprocess.run(cmd)
-    return "output.mp4"
+    # Carregar Configurações
+    with open(os.path.join(project_path, "manifest.json"), 'r') as f:
+        settings = json.load(f)
+        
+    clips = []
+    
+    # Processar 4 blocos
+    for i in range(4):
+        # Assets
+        img_path = os.path.join(project_path, f"image_{i}.png")
+        aud_path = os.path.join(project_path, f"audio_{i}.wav")
+        
+        if not os.path.exists(img_path) or not os.path.exists(aud_path):
+            st.error(f"Faltando arquivos para o bloco {i}")
+            continue
+            
+        # Carregar Imagem Base
+        img_pil = Image.open(img_path).convert("RGB")
+        
+        # Áudio Clip
+        audio_clip = AudioFileClip(aud_path)
+        duration = audio_clip.duration + 0.5 # Pequeno padding
+        
+        # Vídeo Clip Customizado (Frame Generator)
+        # Passamos parâmetros para evitar closures errados
+        def make_frame_wrapper(t):
+            return create_frame(
+                t, img_pil, settings, duration, i,
+                settings['liturgyInfo'], settings['gospelRef'], settings['date']
+            )
+            
+        video_clip =  VideoClip(make_frame=make_frame_wrapper, duration=duration)
+        video_clip = video_clip.set_audio(audio_clip)
+        
+        clips.append(video_clip)
+        st.write(f"Bloco {i+1} preparado ({duration:.1f}s)")
 
-st.title("🚀 Liturgia Render Server")
-uploaded_file = st.file_uploader("Suba o arquivo JSON do Studio", type="json")
+    # Concatenar
+    final_clip = concatenate_videoclips(clips, method="compose")
+    
+    # Exportar
+    output_filename = f"render_{settings['date'].replace('-','.')}.mp4"
+    output_path = os.path.join(project_path, output_filename)
+    
+    # Configuração TikTok (H.264, AAC, bitrate otimizado)
+    final_clip.write_videofile(
+        output_path, 
+        fps=30, 
+        codec='libx264', 
+        audio_codec='aac', 
+        bitrate='2500k',
+        preset='medium',
+        threads=4
+    )
+    
+    return output_path
 
-if uploaded_file:
-    data = json.load(uploaded_file)
-    if st.button("Iniciar Renderização Final"):
-        video_path = render_video(data)
-        with open(video_path, "rb") as f:
-            st.video(f)
-            st.download_button("Baixar Vídeo MP4", f, "video_liturgia.mp4")
+# === UI DO RENDER QUEUE ===
+
+# Simulação de listar pastas (Na prática seria Drive API list_folders)
+if not os.path.exists(RENDER_QUEUE_DIR):
+    os.makedirs(RENDER_QUEUE_DIR)
+
+projects = [f for f in os.listdir(RENDER_QUEUE_DIR) if os.path.isdir(os.path.join(RENDER_QUEUE_DIR, f))]
+
+st.subheader(f"Fila de Renderização ({len(projects)})")
+
+if st.button("🔄 Atualizar Lista"):
+    st.rerun()
+
+for proj in projects:
+    with st.expander(f"📁 Projeto: {proj}", expanded=False):
+        p_path = os.path.join(RENDER_QUEUE_DIR, proj)
+        if os.path.exists(os.path.join(p_path, "manifest.json")):
+            with open(os.path.join(p_path, "manifest.json")) as f:
+                s = json.load(f)
+            st.json(s['visuals'], expanded=False)
+            
+            if st.button(f"🚀 Renderizar {proj}", key=proj):
+                try:
+                    out_file = render_project(p_path)
+                    st.success("Vídeo Renderizado!")
+                    st.video(out_file)
+                    with open(out_file, 'rb') as v:
+                        st.download_button("Baixar MP4", v, file_name=os.path.basename(out_file))
+                except Exception as e:
+                    st.error(f"Erro na renderização: {e}")
