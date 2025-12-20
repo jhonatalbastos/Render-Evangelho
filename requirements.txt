@@ -1,4 +1,8 @@
 streamlit
-pillow
+moviepy==1.0.3
+Pillow
 numpy
-scipy
+decorator
+imageio
+imageio-ffmpeg
+proglog
